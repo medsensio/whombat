@@ -3,6 +3,7 @@
 import datetime
 from pathlib import Path
 from uuid import UUID
+import urllib.parse
 
 from pydantic import BaseModel, Field, FilePath, field_validator
 
@@ -12,6 +13,7 @@ from whombat.schemas.features import Feature
 from whombat.schemas.notes import Note
 from whombat.schemas.tags import Tag
 from whombat.schemas.users import SimpleUser
+from whombat.system import get_settings
 
 __all__ = [
     "Recording",
@@ -21,6 +23,7 @@ __all__ = [
     "RecordingNote",
 ]
 
+use_s3 = get_settings().use_s3
 
 class RecordingCreate(BaseModel):
     """Data for Recording creation."""
@@ -43,18 +46,29 @@ class RecordingCreate(BaseModel):
     rights: str | None = None
     """A text describing the usage rights of the recording."""
 
-    # NOTE: We use a FilePath object as this will make sure that the path is a
-    # valid path and that the file exists.
-    path: FilePath
-    """The path to the audio file."""
-
+    path: str | FilePath
+    """The path to the audio file. Could be a local file path or an S3 key."""
+    
     @field_validator("path")
     def is_an_audio_file(cls, v):
         """Validate that the given path is an audio file."""
-        if not files.is_audio_file(v):
-            raise ValueError("Not an audio file.")
-        return v
 
+        if use_s3:
+            # Validate the S3 path (ensure it doesn't include the 's3://' prefix)
+            # if v.startswith("s3://"):
+            #     raise ValueError("S3 path should not include the 's3://' prefix.")
+
+            # Ensure the path ends with .wav for audio validation
+            if not v.endswith(".wav"):
+                raise ValueError("S3 file path does not point to a valid .wav audio file.")
+        else:
+            # For local file paths, check if the file exists and is an audio file
+            if not isinstance(v, FilePath):
+                raise ValueError("Path must be a valid local file path.")
+            if not files.is_audio_file(v):
+                raise ValueError("Local file path does not point to a valid audio file.")
+
+        return v
 
 class Recording(BaseSchema):
     """Schema for Recording objects returned to the user."""

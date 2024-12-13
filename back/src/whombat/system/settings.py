@@ -111,11 +111,15 @@ class Settings(BaseSettings):
 
     open_on_startup: bool = True
     """Open the application in the browser on startup."""
-
+    
+    use_s3: bool = Field(default=True, env="WHOMBAT_USE_S3")
+    """Flag to enable the use of s3"""
+    
     audio_dir: str = Field(default='s3://your-bucket-name', env='WHOMBAT_AUDIO_DIR')
     aws_access_key_id: Optional[str] = Field(default=None, env='AWS_ACCESS_KEY_ID')
     aws_secret_access_key: Optional[str] = Field(default=None, env='AWS_SECRET_ACCESS_KEY')
     aws_region: Optional[str] = Field(default=None, env='AWS_REGION')
+    aws_bucket_name: Optional[str] = Field(default="whombat-staging", env='AWS_BUCKET_NAME')
     s3_endpoint_url: Optional[str] = Field(default=None, env='S3_ENDPOINT_URL')  # For non-AWS S3-compatible services
 
 

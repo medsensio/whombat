@@ -10,6 +10,7 @@ from fastapi.responses import StreamingResponse
 
 from whombat import api, schemas
 from whombat.routes.dependencies import Session, WhombatSettings
+from whombat.system import get_settings
 
 __all__ = ["audio_router"]
 
@@ -17,10 +18,7 @@ audio_router = APIRouter()
 
 CHUNK_SIZE = 1024 * 256
 
-
-# app.py or the appropriate module
-
-import fsspec
+use_s3 = get_settings().use_s3
 
 @audio_router.get("/stream/")
 async def stream_recording_audio(
@@ -32,11 +30,28 @@ async def stream_recording_audio(
     speed: float = 1,
     range: str = Header(None),
 ) -> Response:
-    """Stream the audio of a recording."""
-    audio_dir = settings.audio_dir
-    recording = await api.recordings.get(session, recording_uuid)
+    """Stream the audio of a recording.
 
-    # Calculate start byte
+    Parameters
+    ----------
+    session
+        Database session.
+    settings
+        Whombat settings.
+    recording_uuid
+        The ID of the recording.
+
+    Returns
+    -------
+    Response
+        The audio file.
+    """
+    audio_dir = settings.audio_dir
+    recording = await api.recordings.get(
+        session,
+        recording_uuid,
+    )
+
     start, _ = range.replace("bytes=", "").split("-")
     start = int(start)
 
@@ -45,17 +60,25 @@ async def stream_recording_audio(
 
     if end_time is not None:
         end_time = end_time * recording.time_expansion
-
-    data, start, end, filesize = await api.load_clip_bytes(
-        path=f"{audio_dir}/{recording.path}",
+        
+    if use_s3:
+        s3_path = str(recording.path).replace("\\", "/")
+        if not s3_path.startswith("s3://"):
+            s3_path = s3_path.replace("s3:/", "s3://")
+            
+        audio_path = s3_path
+    else:
+        audio_path = audio_dir / recording.path
+                
+    data, start, end, filesize = api.load_clip_bytes(
+        path=audio_path, 
         start=start,
         frames=CHUNK_SIZE,
         speed=speed * recording.time_expansion,
         start_time=start_time,
         end_time=end_time,
-        settings=settings,
-    )
-
+    )  
+    
     headers = {
         "Content-Range": f"bytes {start}-{end}/{filesize}",
         "Content-Length": f"{len(data)}",
@@ -67,8 +90,6 @@ async def stream_recording_audio(
         media_type="audio/wav",
         headers=headers,
     )
-
-
 
 @audio_router.get("/download/")
 async def download_recording_audio(

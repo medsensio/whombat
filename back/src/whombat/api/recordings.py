@@ -2,6 +2,7 @@
 
 import datetime
 import logging
+import boto3
 from functools import partial
 from multiprocessing import Pool
 from pathlib import Path
@@ -15,7 +16,6 @@ from soundevent.audio import MediaInfo, compute_md5_checksum, get_media_info
 from sqlalchemy import and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
-import fsspec  # Added import
 from whombat import exceptions, models, schemas
 from whombat.api import common
 from whombat.api.common import BaseAPI
@@ -26,6 +26,9 @@ from whombat.api.users import users
 from whombat.core import files
 from whombat.core.common import remove_duplicates
 from whombat.system import get_settings
+from whombat.schemas.recordings import RecordingCreate 
+from whombat.utils.aws_s3_client import S3Client
+from tempfile import TemporaryDirectory
 
 __all__ = [
     "RecordingAPI",
@@ -34,6 +37,9 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
+s3_client = S3Client()
+
+use_s3 = get_settings().use_s3
 
 class RecordingAPI(
     BaseAPI[
@@ -55,7 +61,7 @@ class RecordingAPI(
         self,
         session: AsyncSession,
         recording_uuid: UUID,
-        audio_dir: str | None = None,  # Changed to str
+        audio_dir: Path | None = None,
     ) -> MediaInfo:
         if audio_dir is None:
             audio_dir = get_settings().audio_dir
@@ -64,28 +70,10 @@ class RecordingAPI(
             return self._media_info_cache[recording_uuid]
 
         recording = await self.get(session, recording_uuid)
-        full_path = f"{audio_dir}/{recording.path}"  # Adjusted path
+        full_path = audio_dir / recording.path
 
-        # Use fsspec to get media info
-        media_info = self._get_media_info_with_fsspec(full_path)
+        media_info = get_media_info(full_path)
         self._media_info_cache[recording_uuid] = media_info
-        return media_info
-
-    def _get_media_info_with_fsspec(self, path: str) -> MediaInfo:
-        settings = get_settings()
-        if path.startswith('s3://'):
-            fs = fsspec.filesystem(
-                's3',
-                key=settings.aws_access_key_id,
-                secret=settings.aws_secret_access_key,
-                client_kwargs={'region_name': settings.aws_region},
-                endpoint_url=settings.s3_endpoint_url,
-            )
-        else:
-            fs = fsspec.filesystem('file')
-
-        with fs.open(path, 'rb') as f:
-            media_info = get_media_info(f)
         return media_info
 
     async def get_by_hash(
@@ -93,7 +81,25 @@ class RecordingAPI(
         session: AsyncSession,
         recording_hash: str,
     ) -> schemas.Recording:
-        """Get a recording by hash."""
+        """Get a recording by hash.
+
+        Parameters
+        ----------
+        session
+            The database session to use.
+        recording_hash
+            The hash of the recording.
+
+        Returns
+        -------
+        recording : schemas.recordings.Recording
+            The recording.
+
+        Raises
+        ------
+        NotFoundError
+            If a recording with the given hash does not exist.
+        """
         recording = await common.get_object(
             session,
             models.Recording,
@@ -106,7 +112,25 @@ class RecordingAPI(
         session: AsyncSession,
         recording_path: Path,
     ) -> schemas.Recording:
-        """Get a recording by path."""
+        """Get a recording by path.
+
+        Parameters
+        ----------
+        session
+            The database session to use.
+        recording_path
+            The path of the recording.
+
+        Returns
+        -------
+        recording : schemas.recordings.Recording
+            The recording.
+
+        Raises
+        ------
+        NotFoundError
+            If a recording with the given path does not exist.
+        """
         recording = await common.get_object(
             session,
             models.Recording,
@@ -124,10 +148,44 @@ class RecordingAPI(
         longitude: float | None = None,
         time_expansion: float = 1.0,
         rights: str | None = None,
-        audio_dir: str | None = None,  # Changed to str
+        audio_dir: Path | None = None,
         **kwargs,
     ) -> schemas.Recording:
-        """Create a recording."""
+        """Create a recording.
+
+        Parameters
+        ----------
+        session
+            The database session to use.
+        path
+            The path to the audio file. This should be relative to the
+            current working directory, or an absolute path.
+        date
+            The date of the recording.
+        time
+            The time of the recording.
+        latitude
+            The latitude of the recording site.
+        longitude
+            The longitude of the recording site.
+        time_expansion
+            Some recordings may be time expanded or time compressed. This
+            value is the factor by which the recording is expanded or
+            compressed. The default value is 1.0.
+        rights
+            A string describing the usage rights of the recording.
+        audio_dir
+            The root directory for audio files. If not given, it will
+            default to the value of `settings.audio_dir`.
+        **kwargs
+            Additional keyword arguments to use when creating the recording,
+            (e.g. `uuid` or `created_on`.)
+
+        Returns
+        -------
+        recording : schemas.recordings.Recording
+            The created recording.
+        """
         if audio_dir is None:
             audio_dir = get_settings().audio_dir
 
@@ -165,47 +223,126 @@ class RecordingAPI(
         audio_dir: str | None = None,  # Changed to str
     ) -> None | Sequence[schemas.Recording]:
         """Create recordings."""
-        if audio_dir is None:
-            audio_dir = get_settings().audio_dir
-
-        validated_data = remove_duplicates(
-            [
-                schemas.RecordingCreate.model_validate(recording)
-                for recording in data
-            ],
-            key=lambda x: x.path,
-        )
-
-        # Use partial to pass audio_dir to the function
-        assemble_data_func = partial(
-            _assemble_recording_data, audio_dir=audio_dir
-        )
-
-        with Pool() as pool:
-            results = pool.map_async(
-                assemble_data_func,
-                validated_data,
+        
+        if use_s3:             
+            if audio_dir is None:
+                audio_dir = get_settings().audio_dir
+                
+            # Filter out non-audio files (e.g., .DS_Store) from S3 file keys
+            valid_audio_files = [
+                key for key in [recording['path'] for recording in data] 
+                if key.endswith('.wav') and not key.endswith('.DS_Store')
+            ]
+            
+            # Recreate the 'data' list with only valid audio files
+            filtered_data = [recording for recording in data if recording['path'] in valid_audio_files]
+                    
+            validated_data = remove_duplicates(
+                [
+                    schemas.RecordingCreate.model_validate(recording)
+                    for recording in filtered_data
+                ],
+                key=lambda x: x.path,
             )
-            all_data: list[dict | None] = results.get()
+            
+            with Pool() as pool:
+                results = pool.map_async(
+                    partial(_assemble_recording_data, audio_dir=audio_dir),
+                    validated_data,
+                )
+                # NOTE: This will block until all results are ready. Might
+                # want to change this in the future as it could be very
+                # slow for large numbers of files or large files.
+                all_data: list[dict | None] = results.get()
+                    
+            try:
+                # Filter and prepare the data for insertion
+                recordings_data = [rec for rec in all_data if rec is not None]
 
-        recordings = await common.create_objects_without_duplicates(
-            session,
-            models.Recording,
-            [rec for rec in all_data if rec is not None],
-            key=lambda recording: recording.get("hash"),
-            key_column=models.Recording.hash,
-        )
+                # Deduplicate based on the "hash" key
+                unique_recordings_data = {rec["hash"]: rec for rec in recordings_data}.values()
 
-        return [schemas.Recording.model_validate(rec) for rec in recordings]
+                # Create Recording objects from the filtered data
+                recording_objects = [
+                    models.Recording(**recording_data) for recording_data in unique_recordings_data
+                ]
+
+                # Add the new recordings to the session
+                session.add_all(recording_objects)
+
+                # Commit the session to persist the data
+                await session.commit()
+
+                # Return or log the saved recordings if needed
+                recordings = recording_objects
+
+            except Exception as e:
+                # Handle exceptions
+                print(f"Error while storing recordings: {e}")
+                await session.rollback()  # Rollback in case of an error
+                                            
+            return [schemas.Recording.model_validate(rec) for rec in recordings]
+        else: 
+            if audio_dir is None:
+                audio_dir = get_settings().audio_dir
+
+            validated_data = remove_duplicates(
+                [
+                    schemas.RecordingCreate.model_validate(recording)
+                    for recording in data
+                ],
+                key=lambda x: x.path,
+            )
+            
+            with Pool() as pool:
+                results = pool.map_async(
+                    partial(_assemble_recording_data, audio_dir=audio_dir),
+                    validated_data,
+                )
+                # NOTE: This will block until all results are ready. Might
+                # want to change this in the future as it could be very
+                # slow for large numbers of files or large files.
+                all_data: list[dict | None] = results.get()
+
+            try:
+                recordings = await common.create_objects_without_duplicates(
+                    session,
+                    models.Recording,
+                    [rec for rec in all_data if rec is not None],
+                    key=lambda recording: recording.get("hash"),
+                    key_column=models.Recording.hash,
+                )
+            except Exception as e:
+                print(f"Error occured in creating recording : {e}")    
+
+            return [schemas.Recording.model_validate(rec) for rec in recordings]
 
     async def update(
         self,
         session: AsyncSession,
         obj: schemas.Recording,
         data: schemas.RecordingUpdate,
-        audio_dir: str | None = None,  # Changed to str
+        audio_dir: Path | None = None,
     ) -> schemas.Recording:
-        """Update a recording."""
+        """Update a recording.
+
+        Parameters
+        ----------
+        session
+            The database session to use.
+        obj
+            The recording to update.
+        data
+            The data to update the recording with.
+        audio_dir
+            The root directory for audio files. If not given, it will
+            default to the value of `settings.audio_dir`.
+
+        Returns
+        -------
+        recording : schemas.recordings.Recording
+            The updated recording.
+        """
         if audio_dir is None:
             audio_dir = get_settings().audio_dir
 
@@ -218,7 +355,14 @@ class RecordingAPI(
                     "recording."
                 )
 
-            data.path = str(data.path)
+            if not data.path.is_relative_to(audio_dir):
+                raise ValueError(
+                    "File is not in audio directory. "
+                    f"\n\tFile:                 {data.path}. "
+                    f"\n\tRoot audio directory: {audio_dir}"
+                )
+
+            data.path = data.path.relative_to(audio_dir)
 
         if data.time_expansion is not None:
             if data.time_expansion != obj.time_expansion:
@@ -234,7 +378,21 @@ class RecordingAPI(
         obj: schemas.Recording,
         time_expansion: float,
     ) -> None:
-        """Adjust the time expansion of a recording."""
+        """Adjust the time expansion of a recording.
+
+        When the time expansion of a recording is adjusted several associated
+        entities must be updated to reflect the new time expansion. Firstly
+        the duration and samplerate of the recording must be updated. Secondly,
+        the time and frequency coordinates of all associated objects must be
+        updated.
+
+        Parameters
+        ----------
+        obj
+            The recording to adjust.
+        time_expansion
+            The new time expansion.
+        """
         factor = time_expansion / obj.time_expansion
         duration = obj.duration / factor
         samplerate = int(obj.samplerate * factor)
@@ -248,66 +406,625 @@ class RecordingAPI(
             samplerate=samplerate,
         )
 
-        # TODO: Update time and frequency coordinates of associated objects
+        # TODO: Update time and frequency coordinates of associated objects:
+        # - clips
+        # - sound_events
 
-    # The rest of the class remains unchanged...
+    async def add_note(
+        self,
+        session: AsyncSession,
+        obj: schemas.Recording,
+        note: schemas.Note,
+    ) -> schemas.Recording:
+        """Add a note to a recording.
+
+        Parameters
+        ----------
+        session
+            The database session to use.
+        obj
+            The recording to add the note to.
+        note
+            The note to add.
+
+        Returns
+        -------
+        recording : schemas.recordings.Recording
+            The updated recording.
+        """
+        for n in obj.notes:
+            if n.uuid == note.uuid:
+                raise exceptions.DuplicateObjectError(
+                    f"Recording already has a note with UUID {note.uuid}"
+                )
+
+        await common.create_object(
+            session,
+            models.RecordingNote,
+            recording_id=obj.id,
+            note_id=note.id,
+        )
+
+        obj = obj.model_copy(update=dict(notes=[*obj.notes, note]))
+        self._update_cache(obj)
+        return obj
+
+    async def add_tag(
+        self,
+        session: AsyncSession,
+        obj: schemas.Recording,
+        tag: schemas.Tag,
+    ) -> schemas.Recording:
+        """Add a tag to a recording.
+
+        Parameters
+        ----------
+        session
+            The database session to use.
+        obj
+            The recording to add the tag to.
+        tag
+            The tag to add.
+
+        Returns
+        -------
+        recording : schemas.recordings.Recording
+            The updated recording.
+        """
+        if tag in obj.tags:
+            raise exceptions.DuplicateObjectError(
+                f"Recording already has the tag {tag}"
+            )
+
+        await common.create_object(
+            session,
+            models.RecordingTag,
+            recording_id=obj.id,
+            tag_id=tag.id,
+        )
+
+        obj = obj.model_copy(update=dict(tags=[*obj.tags, tag]))
+        self._update_cache(obj)
+        return obj
+
+    async def add_feature(
+        self,
+        session: AsyncSession,
+        obj: schemas.Recording,
+        feature: schemas.Feature,
+    ) -> schemas.Recording:
+        """Add a feature to a recording.
+
+        Parameters
+        ----------
+        session
+            The database session to use.
+        obj
+            The recording to add the feature to.
+        feature
+            The feature to add.
+
+        Returns
+        -------
+        recording : schemas.recordings.Recording
+            The updated recording.
+        """
+        for f in obj.features:
+            if f.name == feature.name:
+                raise exceptions.DuplicateObjectError(
+                    f"Recording already has a feature with name {feature.name}"
+                )
+
+        feature_name = await features.get_or_create(
+            session,
+            feature.name,
+        )
+
+        await common.create_object(
+            session,
+            models.RecordingFeature,
+            recording_id=obj.id,
+            feature_name_id=feature_name.id,
+            value=feature.value,
+        )
+
+        obj = obj.model_copy(update=dict(features=[*obj.features, feature]))
+        self._update_cache(obj)
+        return obj
+
+    async def add_owner(
+        self,
+        session: AsyncSession,
+        obj: schemas.Recording,
+        owner: schemas.SimpleUser,
+    ) -> schemas.Recording:
+        """Add an owner to a recording.
+
+        Parameters
+        ----------
+        session
+            The database session to use.
+        obj
+            The recording to add the owner to.
+        owner
+            The owner to add.
+
+        Returns
+        -------
+        recording : schemas.recordings.Recording
+            The updated recording.
+        """
+        for o in obj.owners:
+            if o.id == owner.id:
+                raise exceptions.DuplicateObjectError(
+                    f"Recording already has an owner with ID {owner.id}"
+                )
+
+        await common.create_object(
+            session,
+            models.RecordingOwner,
+            recording_id=obj.id,
+            user_id=owner.id,
+        )
+
+        obj = obj.model_copy(update=dict(owners=[*obj.owners, owner]))
+        self._update_cache(obj)
+        return obj
+
+    async def update_feature(
+        self,
+        session: AsyncSession,
+        obj: schemas.Recording,
+        feature: schemas.Feature,
+    ) -> schemas.Recording:
+        """Update a feature of a recording.
+
+        Parameters
+        ----------
+        session
+            The database session to use.
+        obj
+            The recording to update the feature of.
+        feature
+            The feature to update.
+
+        Returns
+        -------
+        recording : schemas.recordings.Recording
+            The updated recording.
+        """
+        for f in obj.features:
+            if f.name == feature.name:
+                break
+        else:
+            raise exceptions.NotFoundError(
+                f"Recording does not have a feature with name {feature.name}"
+            )
+
+        feature_name = await features.get(session, feature.name)
+
+        await common.update_object(
+            session,
+            models.RecordingFeature,
+            and_(
+                models.RecordingFeature.recording_id == obj.id,
+                models.RecordingFeature.feature_name_id == feature_name.id,
+            ),
+            value=feature.value,
+        )
+
+        obj = obj.model_copy(
+            update=dict(
+                features=[
+                    feature if feature.name == f.name else f
+                    for f in obj.features
+                ]
+            )
+        )
+        self._update_cache(obj)
+        return obj
+
+    async def remove_note(
+        self,
+        session: AsyncSession,
+        obj: schemas.Recording,
+        note: schemas.Note,
+    ):
+        """Remove a note from a recording.
+
+        Parameters
+        ----------
+        session
+            The database session to use.
+        obj
+            The recording to remove the note from.
+        note
+            The note to remove.
+
+        Returns
+        -------
+        recording : schemas.recordings.Recording
+            The updated recording.
+        """
+        for n in obj.notes:
+            if n.uuid == note.uuid:
+                break
+        else:
+            raise exceptions.NotFoundError(
+                f"Recording does not have a note with UUID {note.uuid}"
+            )
+
+        await common.delete_object(
+            session,
+            models.RecordingNote,
+            and_(
+                models.RecordingNote.recording_id == obj.id,
+                models.RecordingNote.note_id == note.id,
+            ),
+        )
+
+        obj = obj.model_copy(
+            update=dict(notes=[n for n in obj.notes if n.uuid != note.uuid])
+        )
+        self._update_cache(obj)
+        return obj
+
+    async def remove_tag(
+        self,
+        session: AsyncSession,
+        obj: schemas.Recording,
+        tag: schemas.Tag,
+    ) -> schemas.Recording:
+        """Remove a tag from a recording.
+
+        Parameters
+        ----------
+        session
+            The database session to use.
+        obj
+            The recording to remove the tag from.
+        tag
+            The tag to remove.
+
+        Returns
+        -------
+        recording : schemas.recordings.Recording
+            The updated recording.
+        """
+        if tag not in obj.tags:
+            raise exceptions.NotFoundError(
+                f"Recording does not have the tag {tag}"
+            )
+
+        await common.delete_object(
+            session,
+            models.RecordingTag,
+            and_(
+                models.RecordingTag.recording_id == obj.id,
+                models.RecordingTag.tag_id == tag.id,
+            ),
+        )
+
+        obj = obj.model_copy(
+            update=dict(tags=[t for t in obj.tags if t != tag])
+        )
+        self._update_cache(obj)
+        return obj
+
+    async def remove_owner(
+        self,
+        session: AsyncSession,
+        obj: schemas.Recording,
+        owner: schemas.SimpleUser,
+    ) -> schemas.Recording:
+        """Remove an owner from a recording.
+
+        Parameters
+        ----------
+        session
+            The database session to use.
+        obj
+            The recording to remove the owner from.
+        owner
+            The owner to remove.
+
+        Returns
+        -------
+        recording : schemas.recordings.Recording
+            The updated recording.
+        """
+        for o in obj.owners:
+            if o.id == owner.id:
+                break
+        else:
+            raise exceptions.NotFoundError(
+                f"Recording does not have an owner with ID {owner.id}"
+            )
+
+        await common.delete_object(
+            session,
+            models.RecordingOwner,
+            and_(
+                models.RecordingOwner.recording_id == obj.id,
+                models.RecordingOwner.user_id == owner.id,
+            ),
+        )
+
+        obj = obj.model_copy(
+            update=dict(owners=[o for o in obj.owners if o != owner])
+        )
+        self._update_cache(obj)
+        return obj
+
+    async def remove_feature(
+        self,
+        session: AsyncSession,
+        obj: schemas.Recording,
+        feature: schemas.Feature,
+    ):
+        """Remove a feature from a recording.
+
+        Parameters
+        ----------
+        session
+            The database session to use.
+        obj
+            The recording to remove the feature from.
+        feature
+            The feature to remove.
+
+        Returns
+        -------
+        recording : schemas.recordings.Recording
+            The updated recording.
+        """
+        for f in obj.features:
+            if f.name == feature.name:
+                break
+        else:
+            raise exceptions.NotFoundError(
+                f"Recording does not have a feature with name {feature.name}"
+            )
+
+        feature_name = await features.get(session, feature.name)
+
+        await common.delete_object(
+            session,
+            models.RecordingFeature,
+            and_(
+                models.RecordingFeature.recording_id == obj.id,
+                models.RecordingFeature.feature_name_id == feature_name.id,
+            ),
+        )
+
+        obj = obj.model_copy(
+            update=dict(
+                features=[f for f in obj.features if f.name != feature.name]
+            )
+        )
+        self._update_cache(obj)
+        return obj
+
+    async def from_soundevent(
+        self,
+        session: AsyncSession,
+        recording: data.Recording,
+        audio_dir: Path | None = None,
+    ) -> schemas.Recording:
+        """Create a recording from a soundevent.Recording.
+
+        Parameters
+        ----------
+        session
+            The database session to use.
+        recording
+            The soundevent.Recording to create the recording from.
+        audio_dir
+            The root directory for audio files. If not given, it will
+            default to the value of `settings.audio_dir`.
+
+        Returns
+        -------
+        recording : schemas.recordings.Recording
+            The created recording.
+        """
+        if audio_dir is None:
+            audio_dir = get_settings().audio_dir
+
+        path = recording.path
+        if not path.is_absolute():
+            path = audio_dir / recording.path
+
+        if not path.is_file():
+            raise FileNotFoundError(f"File {path} does not exist.")
+
+        created = await self.create_from_data(
+            session,
+            path=path.relative_to(audio_dir),
+            time_expansion=recording.time_expansion,
+            date=recording.date,
+            time=recording.time,
+            latitude=recording.latitude,
+            longitude=recording.longitude,
+            rights=recording.rights,
+            uuid=recording.uuid,
+            hash=recording.hash,
+            duration=recording.duration,
+            samplerate=recording.samplerate,
+            channels=recording.channels,
+        )
+        created.path = path
+
+        for owner in recording.owners:
+            owner = await users.from_soundevent(session, owner)
+            created = await self.add_owner(session, created, owner)
+
+        for se_tag in recording.tags:
+            tag = await tags.from_soundevent(session, se_tag)
+            created = await self.add_tag(session, created, tag)
+
+        for note in recording.notes:
+            note = await notes.from_soundevent(session, note)
+            created = await self.add_note(session, created, note)
+
+        for feature in recording.features:
+            feature = await features.from_soundevent(session, feature)
+            created = await self.add_feature(
+                session,
+                created,
+                feature,
+            )
+
+        return created
+
+    def to_soundevent(
+        self,
+        recording: schemas.Recording,
+        audio_dir: Path | None = None,
+    ) -> data.Recording:
+        """Create a soundevent.Recording from a recording.
+
+        Parameters
+        ----------
+        recording
+            The recording to create the soundevent.Recording from.
+        audio_dir
+            The root directory for audio files. If not given, it will
+            default to the value of `settings.audio_dir`.
+
+        Returns
+        -------
+        recording : soundevent.Recording
+            The created soundevent.Recording.
+        """
+        if audio_dir is None:
+            audio_dir = get_settings().audio_dir
+
+        rec_tags = [tags.to_soundevent(tag) for tag in recording.tags]
+
+        rec_notes = [notes.to_soundevent(note) for note in recording.notes]
+
+        rec_features = [
+            features.to_soundevent(feature) for feature in recording.features
+        ]
+
+        rec_owners = [users.to_soundevent(owner) for owner in recording.owners]
+
+        return data.Recording(
+            uuid=recording.uuid,
+            path=audio_dir / recording.path,
+            time_expansion=recording.time_expansion,
+            channels=recording.channels,
+            samplerate=recording.samplerate,
+            duration=recording.duration,
+            date=recording.date,
+            time=recording.time,
+            latitude=recording.latitude,
+            longitude=recording.longitude,
+            rights=recording.rights,
+            tags=rec_tags,
+            notes=rec_notes,
+            features=rec_features,
+            owners=rec_owners,
+        )
+
 
 def validate_path(
     path: Path,
-    audio_dir: str,
-) -> str:
-    """Validate that a path is relative to the audio directory."""
-    # Since audio_dir can be an S3 URI, we treat paths as strings
-    full_path = f"{audio_dir}/{path}"
+    audio_dir: Path,
+) -> Path:
+    """Validate that a path is relative to the audio directory.
 
-    # Optionally, perform validation to ensure the path is within the bucket
+    Parameters
+    ----------
+    path
+        The path to validate, can be absolute or relative. If absolute,
+        it must be relative to the audio directory. If relative,
+        it will be assumed to be relative to the audio directory and
+        the file will be checked to exist.
+    audio_dir
+        The directory to check the path against.
 
-    return full_path
+    Returns
+    -------
+    path : Path
+        The validated path.
+
+    Raises
+    ------
+    ValueError
+        If the path is not relative to the audio directory, or if the
+        file does not exist.
+    """
+    if path.is_absolute():
+        if not path.is_relative_to(audio_dir):
+            raise ValueError(
+                f"The path {path} is not relative to the audio directory "
+                f"{audio_dir}."
+            )
+        path = path.relative_to(audio_dir)
+
+    absolute_path = audio_dir / path
+    if not absolute_path.is_file():
+        raise ValueError(f"File {path} does not exist.")
+
+    return path
 
 
 def _assemble_recording_data(
     data: schemas.RecordingCreate,
-    audio_dir: str,
+    audio_dir: str | Path,
 ) -> dict | None:
-    """Get missing recording data from file."""
+    """Get missing recording data from S3 file."""
     logger.debug(f"Assembling recording data from file: {data.path}")
 
-    settings = get_settings()
-
-    path = f"{audio_dir}/{data.path}"
-
-    # Determine filesystem
-    if path.startswith('s3://'):
-        fs = fsspec.filesystem(
-            's3',
-            key=settings.aws_access_key_id,
-            secret=settings.aws_secret_access_key,
-            client_kwargs={'region_name': settings.aws_region},
-            endpoint_url=settings.s3_endpoint_url,
-        )
+    if use_s3:
+        try:
+            bucket_name, key = parse_s3_path(data.path)
+            
+            # Download the file temporarily to analyze
+            with TemporaryDirectory() as temp_dir:
+                temp_file_path = Path(temp_dir) / key.split('/')[-1]
+                try:
+                    # downloaded_path = Path("C:\\Users\\DELL\\Desktop\\medsensio\\audio_dir\\sample-file-1.wav")
+                    s3_client.download_file(bucket_name=bucket_name, key=key, download_path=str(temp_file_path))
+                except Exception as e:
+                    print(f"Failed to download file from S3. Bucket: {bucket_name}, Key: {key}",
+                        exc_info=e,)
+                    return None
+                
+                # Analyze the file
+                info = files.get_file_info(temp_file_path)
+                # print(f"info : {info}")
+        except (ValueError, KeyError, sf.LibsndfileError, boto3.exceptions.Boto3Error) as e:
+            print(f"Could not get file info from file. {data.path} Skipping file.")
+            return None
     else:
-        fs = fsspec.filesystem('file')
-
-    try:
-        # Open file using fsspec
-        with fs.open(path, 'rb') as f:
-            info = files.get_file_info(f)
-    except (ValueError, KeyError, sf.LibsndfileError) as e:
-        logger.warning(
-            f"Could not get file info from file. {data.path} Skipping file.",
-            exc_info=e,
-        )
-        return None
-
+        try:
+            info = files.get_file_info(data.path)
+        except (ValueError, KeyError, sf.LibsndfileError) as e:
+            logger.warning(
+                f"Could not get file info from file. {data.path} Skipping file.",
+                exc_info=e,
+            )
+            return None    
+    
     if info.media_info is None:
         logger.warning(
-            f"Could not extract media info from file. {data.path} Skipping file."
+            f"Could not extract media info from file. {data.path} Skipping file.",
         )
         return None
 
     if not info.is_audio:
         logger.warning(
             f"File is not an audio file. {data.path} Skipping file.",
+        )
+        return None
+
+    if not use_s3 and not data.path.is_relative_to(audio_dir):
+        logger.warning(
+            f"File is not in the audio directory. {data.path} Skipping file."
+            f"Root audio directory: {audio_dir}",
         )
         return None
 
@@ -320,6 +1037,7 @@ def _assemble_recording_data(
     duration = info.media_info.duration_s / data.time_expansion
     samplerate = int(info.media_info.samplerate_hz * data.time_expansion)
     channels = info.media_info.channels
+    
     return {
         **dict(data),
         **dict(
@@ -327,9 +1045,17 @@ def _assemble_recording_data(
             samplerate=samplerate,
             channels=channels,
             hash=info.hash,
-            path=str(data.path),
+            path=str(data.path) if use_s3 else data.path.relative_to(audio_dir),
         ),
     }
+    
+def parse_s3_path(s3_path: str) -> tuple[str, str]:
+    """Parse an S3 path into bucket name and key."""
+    if not s3_path.startswith("s3://"):
+        raise ValueError("Invalid S3 path. Must start with 's3://'.")
+    
+    _, _, bucket, *key_parts = s3_path.split('/')
+    return bucket, '/'.join(key_parts)
 
 
 recordings = RecordingAPI()

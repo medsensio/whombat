@@ -169,6 +169,7 @@ export default function useRecordingTable({
       footer: (props) => props.column.id,
       cell: ({ row }) => {
         const path = row.getValue("path") as string;
+        const filename = path.split('\\').pop() || path.split('/').pop() || path;
         return (
           <TableCell>
             <Button
@@ -176,7 +177,7 @@ export default function useRecordingTable({
               align="text-left"
               onClick={() => onClickRecording?.(row.original)}
             >
-              {pathFormatter(path)}
+              {pathFormatter(filename)}
             </Button>
           </TableCell>
         );

@@ -1,16 +1,15 @@
-"""API functions to load audio."""
-
 import struct
 from pathlib import Path
 
-import fsspec
 import soundfile as sf
 from soundevent import audio, data
 from soundevent.arrays import extend_dim
 from soundevent.audio.io import audio_to_bytes
+import tempfile
 
 from whombat import schemas
 from whombat.system import get_settings
+from whombat.utils.aws_s3_client import S3Client
 
 __all__ = [
     "load_audio",
@@ -21,14 +20,28 @@ CHUNK_SIZE = 512 * 1024
 HEADER_FORMAT = "<4si4s4sihhiihh4si"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
+s3 = S3Client()
+
+def fetch_s3_file(s3_url: str, local_temp_file: Path) -> Path:
+    """Download a file from S3 to a local temporary file."""
+    bucket_name, key = parse_s3_url(s3_url)
+    s3.download_file(bucket_name, key, str(local_temp_file))
+    return local_temp_file
+
+def parse_s3_url(s3_url: str) -> tuple[str, str]:
+    """Parse an S3 URL into bucket name and key."""
+    if not s3_url.startswith("s3://"):
+        raise ValueError(f"Invalid S3 URL: {s3_url}")
+    parts = s3_url[5:].split("/", 1)
+    return parts[0], parts[1]
 
 def load_audio(
     recording: schemas.Recording,
     start_time: float | None = None,
     end_time: float | None = None,
-    audio_dir: str | None = None,
+    audio_dir: Path | str | None = None,
     audio_parameters: schemas.AudioParameters | None = None,
-    settings=None,
+    use_s3: bool = get_settings().use_s3
 ):
     """Load audio.
 
@@ -41,22 +54,19 @@ def load_audio(
     end_time
         End time in seconds.
     audio_dir
-        The directory where the audio files are stored.
+        The directory where the audio files are stored or the S3 URL.
     audio_parameters
         Audio parameters.
-    settings
-        Application settings containing AWS credentials.
+    use_s3
+        If True, fetch the audio file from S3.
 
     Returns
     -------
-    wave
-        Audio data as a NumPy array.
+    bytes
+        Audio data.
     """
-    if settings is None:
-        settings = get_settings()
-
     if audio_dir is None:
-        audio_dir = settings.audio_dir
+        audio_dir = Path().cwd()
 
     if audio_parameters is None:
         audio_parameters = schemas.AudioParameters()
@@ -67,34 +77,37 @@ def load_audio(
 
     if end_time is None:
         end_time = recording.duration
-
-    # Construct the full path
-    path = f"{audio_dir}/{recording.path}"
-
-    # Open the file using fsspec
-    fs = fsspec.filesystem(
-        's3',
-        key=settings.aws_access_key_id,
-        secret=settings.aws_secret_access_key,
-        client_kwargs={'region_name': settings.aws_region},
-        endpoint_url=settings.s3_endpoint_url,
+        
+    local_audio_path = None
+    
+    if use_s3:
+        s3_path = str(recording.path).replace("\\", "/")
+        if not s3_path.startswith("s3://"):
+            s3_path = s3_path.replace("s3:/", "s3://")
+            
+        local_temp_file = Path(tempfile.gettempdir()) / "temp_audio_file.wav"
+        local_audio_path = fetch_s3_file(s3_path, local_temp_file)
+    else:
+        local_audio_path = audio_dir / recording.path
+        
+    clip = data.Clip(
+        recording=data.Recording(
+            uuid=recording.uuid,
+            path=local_audio_path,
+            duration=recording.duration,
+            samplerate=recording.samplerate,
+            channels=recording.channels,
+            time_expansion=recording.time_expansion,
+        ),
+        start_time=start_time,
+        end_time=end_time,
     )
+    
+    if clip.start_time < 0:
+        clip.start_time = 0
 
-    with fs.open(path, 'rb') as f:
-        # Use soundfile to read the audio data
-        with sf.SoundFile(f) as sf_file:
-            samplerate = int(sf_file.samplerate * recording.time_expansion)
-            channels = sf_file.channels
-
-            # Calculate start and end frames
-            start_frame = int(start_time * samplerate)
-            end_frame = int(end_time * samplerate)
-
-            sf_file.seek(start_frame)
-            frames_to_read = end_frame - start_frame
-            audio_data = sf_file.read(frames_to_read, dtype='float32', always_2d=True)
-
-    wave = audio_data
+    # Load audio.
+    wave = audio.load_clip(clip)
 
     if start_time < 0:
         wave = extend_dim(wave, "time", start=start_time)
@@ -117,7 +130,6 @@ def load_audio(
 
     return wave
 
-
 BIT_DEPTH_MAP: dict[str, int] = {
     "PCM_S8": 8,
     "PCM_16": 16,
@@ -128,9 +140,8 @@ BIT_DEPTH_MAP: dict[str, int] = {
     "DOUBLE": 64,
 }
 
-
 def load_clip_bytes(
-    path: str,
+    path: Path | str,
     start: int,
     speed: float = 1,
     frames: int = 8192,
@@ -138,14 +149,14 @@ def load_clip_bytes(
     start_time: float | None = None,
     end_time: float | None = None,
     bit_depth: int = 16,
-    settings=None,
+    use_s3: bool = get_settings().use_s3
 ) -> tuple[bytes, int, int, int]:
     """Load audio.
 
     Parameters
     ----------
     path
-        The path to the audio file.
+        The path to the audio file or S3 URL.
     start
         Start byte.
     speed
@@ -161,8 +172,8 @@ def load_clip_bytes(
         The time in seconds at which to stop reading the audio.
     bit_depth
         The bit depth of the resulting audio. By default, it is 16 bits.
-    settings
-        Application settings containing AWS credentials.
+    use_s3
+        If True, fetch the audio file from S3.
 
     Returns
     -------
@@ -175,78 +186,76 @@ def load_clip_bytes(
     filesize
         Total size of clip in bytes.
     """
-    if settings is None:
-        settings = get_settings()
-
-    # Determine the filesystem based on the path
-    if path.startswith('s3://'):
-        fs = fsspec.filesystem(
-            's3',
-            key=settings.aws_access_key_id,
-            secret=settings.aws_secret_access_key,
-            client_kwargs={'region_name': settings.aws_region},
-            endpoint_url=settings.s3_endpoint_url,
-        )
+    local_audio_path = None
+    if use_s3:
+        # Fetch file from S3
+        local_temp_file = Path(tempfile.gettempdir()) / "temp_audio_file.wav"
+        local_audio_path = fetch_s3_file(path, local_temp_file)
     else:
-        fs = fsspec.filesystem('file')
+        local_audio_path = Path(path)
+        
+    with sf.SoundFile(local_audio_path) as sf_file:
+        samplerate = int(sf_file.samplerate * time_expansion)
+        channels = sf_file.channels
 
-    # Open the file using fs
-    with fs.open(path, 'rb') as f:
-        # Use sf.SoundFile with file-like object
-        with sf.SoundFile(f) as sf_file:
-            samplerate = int(sf_file.samplerate * time_expansion)
-            channels = sf_file.channels
+        # Calculate start and end frames based on start and end times
+        # to ensure that the requested piece of audio is loaded.
+        if start_time is None:
+            start_time = 0
+        start_frame = int(start_time * samplerate)
 
-            # Calculate start and end frames based on start and end times
-            if start_time is None:
-                start_time = 0
-            start_frame = int(start_time * samplerate)
+        end_frame = sf_file.frames
+        if end_time is not None:
+            end_frame = int(end_time * samplerate)
 
-            end_frame = sf_file.frames
-            if end_time is not None:
-                end_frame = int(end_time * samplerate)
+        # Calculate the total number of frames and the size of the audio
+        # data in bytes.
+        total_frames = end_frame - start_frame
+        bytes_per_frame = channels * bit_depth // 8
+        filesize = total_frames * bytes_per_frame
 
-            # Calculate the total number of frames and the size of the audio data in bytes.
-            total_frames = end_frame - start_frame
-            bytes_per_frame = channels * bit_depth // 8
-            filesize = total_frames * bytes_per_frame
+        # Compute the offset, which is the frame at which to start reading
+        # the audio data.
+        offset = start_frame
+        if start != 0:
+            # When the start byte is not 0, calculate the offset in frames
+            # and add it to the start frame. Note that we need to
+            # remove the size of the header from the start byte to correctly
+            # calculate the offset in frames.
+            offset_frames = (start - HEADER_SIZE) // bytes_per_frame
+            offset += offset_frames
 
-            # Compute the offset
-            offset = start_frame
-            if start != 0:
-                offset_frames = (start - HEADER_SIZE) // bytes_per_frame
-                offset += offset_frames
+        # Make sure that the number of frames to read is not greater than
+        # the number of frames requested.
+        frames = min(frames, end_frame - offset)
 
-            # Ensure frames to read is within bounds
-            frames = min(frames, end_frame - offset)
+        sf_file.seek(offset)
+        audio_data = sf_file.read(frames, fill_value=0, always_2d=True)
 
-            sf_file.seek(offset)
-            audio_data = sf_file.read(frames, fill_value=0, always_2d=True)
+        # Convert the audio data to raw bytes
+        audio_bytes = audio_to_bytes(
+            audio_data,
+            samplerate=samplerate,
+            bit_depth=bit_depth,
+        )
 
-            # Convert the audio data to raw bytes
-            audio_bytes = audio_to_bytes(
-                audio_data,
-                samplerate=samplerate,
+        # Generate the WAV header if the start byte is 0 and
+        # append to the start of the audio data.
+        if start == 0:
+            header = generate_wav_header(
+                samplerate=int(samplerate * speed),
+                channels=channels,
+                data_size=filesize,
                 bit_depth=bit_depth,
             )
+            audio_bytes = header + audio_bytes
 
-            # Generate the WAV header if necessary
-            if start == 0:
-                header = generate_wav_header(
-                    samplerate=int(samplerate * speed),
-                    channels=channels,
-                    data_size=filesize,
-                    bit_depth=bit_depth,
-                )
-                audio_bytes = header + audio_bytes
-
-            return (
-                audio_bytes,
-                start,
-                start + len(audio_bytes),
-                filesize + HEADER_SIZE,
-            )
-
+        return (
+            audio_bytes,
+            start,
+            start + len(audio_bytes),
+            filesize + HEADER_SIZE,
+        )
 
 def generate_wav_header(
     samplerate: int,
@@ -268,8 +277,8 @@ def generate_wav_header(
         Sample rate in Hz.
     channels
         Number of channels.
-    data_size
-        Size of the data chunk.
+    samples
+        Number of samples.
     bit_depth
         The number of bits per sample. By default, it is 16 bits.
 
@@ -288,7 +297,7 @@ def generate_wav_header(
         b"WAVE",  # RIFF chunk id
         b"fmt ",  # fmt chunk id
         16,  # Size of the fmt chunk
-        1,  # Audio format (1 corresponds to PCM)
+        1,  # Audio format (3 corresponds to float)
         channels,  # Number of channels
         samplerate,  # Sample rate in Hz
         byte_rate,  # Byte rate
