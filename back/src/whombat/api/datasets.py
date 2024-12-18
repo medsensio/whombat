@@ -331,7 +331,7 @@ class DatasetAPI(
                         models.DatasetRecording(
                             dataset_id=obj.id,
                             recording_id=recording.id,
-                            path=str(recording.path).replace("s3://whombat-staging/", "").split('/')[-1],  # Store the path as a string
+                            path=str(recording.path).replace("s3://{bucket_name}/", "").split('/')[-1], 
                         )
                     )
                     # Add the pair to the set of existing pairs to avoid future duplicates in this batch
