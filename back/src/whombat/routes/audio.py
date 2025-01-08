@@ -10,6 +10,7 @@ from fastapi.responses import StreamingResponse
 
 from whombat import api, schemas
 from whombat.routes.dependencies import Session, WhombatSettings
+from whombat.system import get_settings
 
 __all__ = ["audio_router"]
 
@@ -17,6 +18,7 @@ audio_router = APIRouter()
 
 CHUNK_SIZE = 1024 * 256
 
+use_s3 = get_settings().use_s3
 
 @audio_router.get("/stream/")
 async def stream_recording_audio(
@@ -58,16 +60,25 @@ async def stream_recording_audio(
 
     if end_time is not None:
         end_time = end_time * recording.time_expansion
-
+        
+    if use_s3:
+        s3_path = str(recording.path).replace("\\", "/")
+        if not s3_path.startswith("s3://"):
+            s3_path = s3_path.replace("s3:/", "s3://")
+            
+        audio_path = s3_path
+    else:
+        audio_path = audio_dir / recording.path
+                
     data, start, end, filesize = api.load_clip_bytes(
-        path=audio_dir / recording.path,
+        path=audio_path, 
         start=start,
         frames=CHUNK_SIZE,
         speed=speed * recording.time_expansion,
         start_time=start_time,
         end_time=end_time,
-    )
-
+    )  
+    
     headers = {
         "Content-Range": f"bytes {start}-{end}/{filesize}",
         "Content-Length": f"{len(data)}",
@@ -79,7 +90,6 @@ async def stream_recording_audio(
         media_type="audio/wav",
         headers=headers,
     )
-
 
 @audio_router.get("/download/")
 async def download_recording_audio(

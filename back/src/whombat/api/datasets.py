@@ -5,7 +5,11 @@ import uuid
 import warnings
 from pathlib import Path
 from typing import Sequence
+import boto3 
+from botocore.exceptions import NoCredentialsError, PartialCredentialsError 
+from whombat.utils.aws_s3_client import S3Client
 
+from fastapi import HTTPException
 import pandas as pd
 from soundevent import data
 from sqlalchemy import select, tuple_
@@ -25,6 +29,10 @@ __all__ = [
     "datasets",
 ]
 
+s3_client = S3Client()
+
+use_s3 = get_settings().use_s3
+bucket_name = get_settings().aws_bucket_name
 
 class DatasetAPI(
     BaseAPI[
@@ -306,43 +314,83 @@ class DatasetAPI(
             The recordings to add to the dataset.
         """
         data = []
-        for recording in recordings:
-            if not recording.path.is_relative_to(obj.audio_dir):
-                warnings.warn(
-                    "The recording is not part of the dataset audio "
-                    f"directory. \ndataset = {obj}\nrecording = {recording}",
-                    stacklevel=2,
-                )
-                continue
+        if use_s3:
+            existing_recordings = set()
 
-            data.append(
-                dict(
-                    dataset_id=obj.id,
-                    recording_id=recording.id,
-                    path=recording.path.relative_to(obj.audio_dir),
+            # First, collect the existing dataset-recording pairs to avoid duplicates
+            existing_pairs = await session.execute(
+                select(models.DatasetRecording.dataset_id, models.DatasetRecording.recording_id)
+                .filter(models.DatasetRecording.dataset_id == obj.id)
+            )
+            existing_pairs = set(existing_pairs.fetchall())
+
+            for recording in recordings:
+                # Check if the dataset-recording pair already exists
+                if (obj.id, recording.id) not in existing_pairs:
+                    data.append(
+                        models.DatasetRecording(
+                            dataset_id=obj.id,
+                            recording_id=recording.id,
+                            path=str(recording.path).replace("s3://{bucket_name}/", "").split('/')[-1], 
+                        )
+                    )
+                    # Add the pair to the set of existing pairs to avoid future duplicates in this batch
+                    existing_pairs.add((obj.id, recording.id))
+
+            # Add the new DatasetRecording entries to the session
+            if data:
+                session.add_all(data)
+                await session.commit() 
+
+            # Update the recording count on the Dataset object
+            obj = obj.model_copy(
+                update=dict(recording_count=obj.recording_count + len(data))
+            )
+            self._update_cache(obj)
+
+            # Return the newly created DatasetRecording objects
+            return [
+                {column.name: getattr(recording, column.name) for column in models.DatasetRecording.__table__.columns}
+                for recording in data
+            ]
+        else:
+            for recording in recordings:
+                if not recording.path.is_relative_to(obj.audio_dir):
+                    warnings.warn(
+                        "The recording is not part of the dataset audio "
+                        f"directory. \ndataset = {obj}\nrecording = {recording}",
+                        stacklevel=2,
+                    )
+                    continue
+
+                data.append(
+                    dict(
+                        dataset_id=obj.id,
+                        recording_id=recording.id,
+                        path=recording.path.relative_to(obj.audio_dir),
+                    )
                 )
+
+            db_recordings = await common.create_objects_without_duplicates(
+                session,
+                models.DatasetRecording,
+                data,
+                key=lambda x: (x.get("dataset_id"), x.get("recording_id")),
+                key_column=tuple_(
+                    models.DatasetRecording.dataset_id,
+                    models.DatasetRecording.recording_id,
+                ),
             )
 
-        db_recordings = await common.create_objects_without_duplicates(
-            session,
-            models.DatasetRecording,
-            data,
-            key=lambda x: (x.get("dataset_id"), x.get("recording_id")),
-            key_column=tuple_(
-                models.DatasetRecording.dataset_id,
-                models.DatasetRecording.recording_id,
-            ),
-        )
-
-        obj = obj.model_copy(
-            update=dict(
-                recording_count=obj.recording_count + len(db_recordings)
+            obj = obj.model_copy(
+                update=dict(
+                    recording_count=obj.recording_count + len(db_recordings)
+                )
             )
-        )
-        self._update_cache(obj)
-        return [
-            schemas.DatasetRecording.model_validate(x) for x in db_recordings
-        ]
+            self._update_cache(obj)
+            return [
+                schemas.DatasetRecording.model_validate(x) for x in db_recordings
+            ]
 
     async def get_recordings(
         self,
@@ -399,7 +447,8 @@ class DatasetAPI(
         obj: schemas.Dataset,
         audio_dir: Path | None = None,
     ) -> list[schemas.DatasetFile]:
-        """Compute the state of the dataset recordings.
+        """
+        Compute the state of the dataset recordings.
 
         The dataset directory is scanned for audio files and compared to the
         registered dataset recordings in the database. The following states are
@@ -414,26 +463,39 @@ class DatasetAPI(
 
         Parameters
         ----------
-        session
+        session : AsyncSession
             The database session to use.
-        obj
+        obj : schemas.Dataset
             The dataset to get the state of.
-        audio_dir
+        audio_dir : Path | None
             The root audio directory, by default None. If None, the root audio
             directory from the settings will be used.
 
         Returns
         -------
-        files : list[schemas.DatasetFile]
+        list[schemas.DatasetFile]
+            List of DatasetFile objects with their state.
         """
-        if audio_dir is None:
-            audio_dir = get_settings().audio_dir
 
-        # Get the files in the dataset directory.
-        file_list = files.get_audio_files_in_folder(
-            audio_dir / obj.audio_dir,
-            relative=True,
-        )
+        if use_s3:
+            dataset_dir = str(obj.audio_dir) 
+
+            try:
+                # Fetch files from S3
+                file_keys = s3_client.list_files(bucket_name=bucket_name, prefix=dataset_dir)
+                file_list = [Path(f"s3:/{bucket_name}/{key}") for key in file_keys if key.startswith(dataset_dir)]
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Error accessing S3 bucket : {str(e)}")
+        else:
+            # Use local file system logic
+            if audio_dir is None:
+                audio_dir = get_settings().audio_dir
+
+            # Get the files in the dataset directory
+            file_list = files.get_audio_files_in_folder(
+                audio_dir / obj.audio_dir,
+                relative=True,
+            )
 
         # NOTE: Better to use this query than reusing the get_recordings
         # function because we don't need to retrieve all information about the
@@ -441,7 +503,7 @@ class DatasetAPI(
         query = select(models.DatasetRecording.path).where(
             models.DatasetRecording.dataset_id == obj.id
         )
-        result = await session.execute(query)
+        result = await session.execute(query)       
         db_files = [Path(path) for path in result.scalars().all()]
 
         existing_files = set(file_list) & set(db_files)
@@ -472,7 +534,6 @@ class DatasetAPI(
                     state=schemas.FileState.UNREGISTERED,
                 )
             )
-
         return ret
 
     async def from_soundevent(
@@ -570,16 +631,16 @@ class DatasetAPI(
         self,
         session: AsyncSession,
         name: str,
-        dataset_dir: Path,
+        dataset_dir: str | Path,
         description: str | None = None,
         audio_dir: Path | None = None,
         **kwargs,
     ) -> schemas.Dataset:
         """Create a dataset.
 
-        This function will create a dataset and populate it with the audio
-        files found in the given directory. It will look recursively for audio
-        files within the directory.
+        This function will create a dataset and populate it with audio files.
+        If `use_s3` is True, it will fetch files from an S3 bucket; otherwise,
+        it will use local files.
 
         Parameters
         ----------
@@ -588,7 +649,7 @@ class DatasetAPI(
         name
             The name of the dataset.
         dataset_dir
-            The directory of the dataset.
+            The directory of the dataset. For S3, this is the prefix.
         description
             The description of the dataset, by default None.
         audio_dir
@@ -605,58 +666,109 @@ class DatasetAPI(
         ------
         ValueError
             If a dataset with the given name or audio directory already exists.
-        pydantic.ValidationError
-            If the given audio directory does not exist.
+        RuntimeError
+            If no recordings were created.
         """
-        if audio_dir is None:
-            audio_dir = get_settings().audio_dir
+        if use_s3:
+            # Ensure dataset_dir ends with a `/`
+            if not dataset_dir.endswith("/"):
+                dataset_dir = f"{dataset_dir}/"
 
-        # Make sure the path is relative to the root audio directory.
-        if not dataset_dir.is_relative_to(audio_dir):
-            raise ValueError(
-                "The audio directory must be relative to the root audio "
-                "directory."
-                f"\n\tRoot audio directory: {audio_dir}"
-                f"\n\tAudio directory: {dataset_dir}"
+            # Fetch files from S3
+            try:
+                file_keys = s3_client.list_files(bucket_name=bucket_name, prefix=dataset_dir)
+                if not file_keys:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"No files found in S3 bucket with prefix '{dataset_dir}'"
+                    )
+            except HTTPException as e:
+                raise e
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
+            # Validate the dataset creation data
+            data = schemas.DatasetCreate(
+                name=name,
+                description=description,
+                audio_dir=dataset_dir,  # S3 prefix
             )
 
-        # Validate the creation data.
-        data = schemas.DatasetCreate(
-            name=name,
-            description=description,
-            audio_dir=dataset_dir,
-        )
+            obj = await self.create_from_data(
+                session,
+                data.model_copy(
+                    update=dict(audio_dir=dataset_dir)  # Pass S3 prefix directly
+                ),
+                **kwargs,
+            )
 
-        obj = await self.create_from_data(
-            session,
-            data.model_copy(
-                update=dict(audio_dir=data.audio_dir.relative_to(audio_dir))
-            ),
-            **kwargs,
-        )
+            # Filter out non-audio files (e.g., .DS_Store)
+            valid_audio_files = [key for key in file_keys if key.endswith('.wav')]
+            
+            # Create recording entries from S3 file keys
+            try:
+                recording_list = await recordings.create_many(
+                    session,
+                    [dict(path=f"s3://{bucket_name}/{key}") for key in valid_audio_files],
+                    audio_dir=dataset_dir,
+                )
+            except Exception as e: 
+                print(f"Error in creating recording : {e}")    
+    
+        else:
+            if audio_dir is None:
+                audio_dir = get_settings().audio_dir
 
-        file_list = files.get_audio_files_in_folder(
-            dataset_dir,
-            relative=False,
-        )
+            # Make sure the path is relative to the root audio directory.
+            if not dataset_dir.is_relative_to(audio_dir):
+                raise ValueError(
+                    "The audio directory must be relative to the root audio "
+                    "directory."
+                    f"\n\tRoot audio directory: {audio_dir}"
+                    f"\n\tAudio directory: {dataset_dir}"
+                )
+                
+            # Validate the dataset creation data
+            data = schemas.DatasetCreate(
+                name=name,
+                description=description,
+                audio_dir=dataset_dir,
+            )
+            
+            obj = await self.create_from_data(
+                session,
+                data.model_copy(
+                    update=dict(audio_dir=data.audio_dir.relative_to(audio_dir))
+                ),
+                **kwargs,
+            )
+            
+            file_list = files.get_audio_files_in_folder(
+                dataset_dir,
+                relative=False,
+            )
 
-        recording_list = await recordings.create_many(
-            session,
-            [dict(path=file) for file in file_list],
-            audio_dir=audio_dir,
-        )
+            # Create recording entries from local file paths
+            recording_list = await recordings.create_many(
+                session,
+                [dict(path=file) for file in file_list],
+                audio_dir=audio_dir,
+            )
+            
+            if not recording_list:
+                raise RuntimeError("No recordings were created.")
 
-        if recording_list is None:
-            raise RuntimeError("No recordings were created.")
-
-        dataset_recordigns = await self.add_recordings(
+        # Associate recordings with the dataset
+        dataset_recordings = await self.add_recordings(
             session, obj, recording_list
         )
 
+        # Update dataset metadata
         obj = obj.model_copy(
-            update=dict(recording_count=len(dataset_recordigns))
+            update=dict(recording_count=len(dataset_recordings))
         )
         self._update_cache(obj)
+        
         return obj
 
     async def to_dataframe(

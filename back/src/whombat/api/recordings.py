@@ -2,6 +2,7 @@
 
 import datetime
 import logging
+import boto3
 from functools import partial
 from multiprocessing import Pool
 from pathlib import Path
@@ -25,6 +26,9 @@ from whombat.api.users import users
 from whombat.core import files
 from whombat.core.common import remove_duplicates
 from whombat.system import get_settings
+from whombat.schemas.recordings import RecordingCreate 
+from whombat.utils.aws_s3_client import S3Client
+from tempfile import TemporaryDirectory
 
 __all__ = [
     "RecordingAPI",
@@ -33,6 +37,9 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
+s3_client = S3Client()
+
+use_s3 = get_settings().use_s3
 
 class RecordingAPI(
     BaseAPI[
@@ -213,68 +220,102 @@ class RecordingAPI(
         self,
         session: AsyncSession,
         data: Sequence[dict],
-        audio_dir: Path | None = None,
+        audio_dir: str | None = None,  # Changed to str
     ) -> None | Sequence[schemas.Recording]:
-        """Create recordings.
-
-        If you want to create a single recording, use `create_recording`.
-        However if you want to create multiple recordings, it is more efficient
-        to use this function.
-
-        Parameters
-        ----------
-        session
-            The database session to use.
-        data
-            The data to create the recordings with.
-        audio_dir
-            The root directory for audio files. If not given, it will
-            default to the value of `settings.audio_dir`.
-
-        Returns
-        -------
-        recordings : list[schemas.recordings.Recording]
-            The created recordings.
-
-        Notes
-        -----
-        This function will only create recordings for files that:
-        - are audio files (according to `files.is_audio_file`)
-        - media info can be extracted from it.
-        - do not already exist in the database.
-
-        Any files that do not meet these criteria will be silently ignored.
-        """
-        if audio_dir is None:
-            audio_dir = get_settings().audio_dir
-
-        validated_data = remove_duplicates(
-            [
-                schemas.RecordingCreate.model_validate(recording)
-                for recording in data
-            ],
-            key=lambda x: x.path,
-        )
-
-        with Pool() as pool:
-            results = pool.map_async(
-                partial(_assemble_recording_data, audio_dir=audio_dir),
-                validated_data,
+        """Create recordings."""
+        
+        if use_s3:             
+            if audio_dir is None:
+                audio_dir = get_settings().audio_dir
+                
+            # Filter out non-audio files (e.g., .DS_Store) from S3 file keys
+            valid_audio_files = [
+                key for key in [recording['path'] for recording in data] 
+                if key.endswith('.wav') and not key.endswith('.DS_Store')
+            ]
+            
+            # Recreate the 'data' list with only valid audio files
+            filtered_data = [recording for recording in data if recording['path'] in valid_audio_files]
+                    
+            validated_data = remove_duplicates(
+                [
+                    schemas.RecordingCreate.model_validate(recording)
+                    for recording in filtered_data
+                ],
+                key=lambda x: x.path,
             )
-            # NOTE: This will block until all results are ready. Might
-            # want to change this in the future as it could be very
-            # slow for large numbers of files or large files.
-            all_data: list[dict | None] = results.get()
+            
+            with Pool() as pool:
+                results = pool.map_async(
+                    partial(_assemble_recording_data, audio_dir=audio_dir),
+                    validated_data,
+                )
+                # NOTE: This will block until all results are ready. Might
+                # want to change this in the future as it could be very
+                # slow for large numbers of files or large files.
+                all_data: list[dict | None] = results.get()
+                    
+            try:
+                # Filter and prepare the data for insertion
+                recordings_data = [rec for rec in all_data if rec is not None]
 
-        recordings = await common.create_objects_without_duplicates(
-            session,
-            models.Recording,
-            [rec for rec in all_data if rec is not None],
-            key=lambda recording: recording.get("hash"),
-            key_column=models.Recording.hash,
-        )
+                # Deduplicate based on the "hash" key
+                unique_recordings_data = {rec["hash"]: rec for rec in recordings_data}.values()
 
-        return [schemas.Recording.model_validate(rec) for rec in recordings]
+                # Create Recording objects from the filtered data
+                recording_objects = [
+                    models.Recording(**recording_data) for recording_data in unique_recordings_data
+                ]
+
+                # Add the new recordings to the session
+                session.add_all(recording_objects)
+
+                # Commit the session to persist the data
+                await session.commit()
+
+                # Return or log the saved recordings if needed
+                recordings = recording_objects
+
+            except Exception as e:
+                # Handle exceptions
+                print(f"Error while storing recordings: {e}")
+                await session.rollback()  # Rollback in case of an error
+                                            
+            return [schemas.Recording.model_validate(rec) for rec in recordings]
+        else: 
+            if audio_dir is None:
+                audio_dir = get_settings().audio_dir
+
+            validated_data = remove_duplicates(
+                [
+                    schemas.RecordingCreate.model_validate(recording)
+                    for recording in data
+                ],
+                key=lambda x: x.path,
+            )
+            
+            with Pool() as pool:
+                results = pool.map_async(
+                    partial(_assemble_recording_data, audio_dir=audio_dir),
+                    validated_data,
+                )
+                # NOTE: This will block until all results are ready. Might
+                # want to change this in the future as it could be very
+                # slow for large numbers of files or large files.
+                all_data: list[dict | None] = results.get()
+
+            try:
+                recordings = await common.create_objects_without_duplicates(
+                    session,
+                    models.Recording,
+                    [rec for rec in all_data if rec is not None],
+                    key=lambda recording: recording.get("hash"),
+                    key_column=models.Recording.hash,
+                )
+            except Exception as e:
+                print(f"Error occured in creating recording : {e}")    
+
+            return [schemas.Recording.model_validate(rec) for rec in recordings]
 
     async def update(
         self,
@@ -932,24 +973,45 @@ def validate_path(
 
 def _assemble_recording_data(
     data: schemas.RecordingCreate,
-    audio_dir: Path,
+    audio_dir: str | Path,
 ) -> dict | None:
-    """Get missing recording data from file."""
+    """Get missing recording data from S3 file."""
     logger.debug(f"Assembling recording data from file: {data.path}")
 
-    try:
-        info = files.get_file_info(data.path)
-    except (ValueError, KeyError, sf.LibsndfileError) as e:
-        logger.warning(
-            f"Could not get file info from file. {data.path} Skipping file.",
-            exc_info=e,
-        )
-        return None
-
+    if use_s3:
+        try:
+            bucket_name, key = parse_s3_path(data.path)
+            
+            # Download the file temporarily to analyze
+            with TemporaryDirectory() as temp_dir:
+                temp_file_path = Path(temp_dir) / key.split('/')[-1]
+                try:
+                    # downloaded_path = Path("C:\\Users\\DELL\\Desktop\\medsensio\\audio_dir\\sample-file-1.wav")
+                    s3_client.download_file(bucket_name=bucket_name, key=key, download_path=str(temp_file_path))
+                except Exception as e:
+                    print(f"Failed to download file from S3. Bucket: {bucket_name}, Key: {key}",
+                        exc_info=e,)
+                    return None
+                
+                # Analyze the file
+                info = files.get_file_info(temp_file_path)
+                # print(f"info : {info}")
+        except (ValueError, KeyError, sf.LibsndfileError, boto3.exceptions.Boto3Error) as e:
+            print(f"Could not get file info from file. {data.path} Skipping file.")
+            return None
+    else:
+        try:
+            info = files.get_file_info(data.path)
+        except (ValueError, KeyError, sf.LibsndfileError) as e:
+            logger.warning(
+                f"Could not get file info from file. {data.path} Skipping file.",
+                exc_info=e,
+            )
+            return None    
+    
     if info.media_info is None:
         logger.warning(
-            f"Could not extract media info from file. {data.path}"
-            "Skipping file.",
+            f"Could not extract media info from file. {data.path} Skipping file.",
         )
         return None
 
@@ -959,9 +1021,9 @@ def _assemble_recording_data(
         )
         return None
 
-    if not data.path.is_relative_to(audio_dir):
+    if not use_s3 and not data.path.is_relative_to(audio_dir):
         logger.warning(
-            f"File is not in audio directory. {data.path} Skipping file."
+            f"File is not in the audio directory. {data.path} Skipping file."
             f"Root audio directory: {audio_dir}",
         )
         return None
@@ -975,6 +1037,7 @@ def _assemble_recording_data(
     duration = info.media_info.duration_s / data.time_expansion
     samplerate = int(info.media_info.samplerate_hz * data.time_expansion)
     channels = info.media_info.channels
+    
     return {
         **dict(data),
         **dict(
@@ -982,9 +1045,17 @@ def _assemble_recording_data(
             samplerate=samplerate,
             channels=channels,
             hash=info.hash,
-            path=data.path.relative_to(audio_dir),
+            path=str(data.path) if use_s3 else data.path.relative_to(audio_dir),
         ),
     }
+    
+def parse_s3_path(s3_path: str) -> tuple[str, str]:
+    """Parse an S3 path into bucket name and key."""
+    if not s3_path.startswith("s3://"):
+        raise ValueError("Invalid S3 path. Must start with 's3://'.")
+    
+    _, _, bucket, *key_parts = s3_path.split('/')
+    return bucket, '/'.join(key_parts)
 
 
 recordings = RecordingAPI()

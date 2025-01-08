@@ -1,5 +1,3 @@
-"""API functions to load audio."""
-
 import struct
 from pathlib import Path
 
@@ -7,8 +5,11 @@ import soundfile as sf
 from soundevent import audio, data
 from soundevent.arrays import extend_dim
 from soundevent.audio.io import audio_to_bytes
+import tempfile
 
 from whombat import schemas
+from whombat.system import get_settings
+from whombat.utils.aws_s3_client import S3Client
 
 __all__ = [
     "load_audio",
@@ -19,13 +20,28 @@ CHUNK_SIZE = 512 * 1024
 HEADER_FORMAT = "<4si4s4sihhiihh4si"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
+s3 = S3Client()
+
+def fetch_s3_file(s3_url: str, local_temp_file: Path) -> Path:
+    """Download a file from S3 to a local temporary file."""
+    bucket_name, key = parse_s3_url(s3_url)
+    s3.download_file(bucket_name, key, str(local_temp_file))
+    return local_temp_file
+
+def parse_s3_url(s3_url: str) -> tuple[str, str]:
+    """Parse an S3 URL into bucket name and key."""
+    if not s3_url.startswith("s3://"):
+        raise ValueError(f"Invalid S3 URL: {s3_url}")
+    parts = s3_url[5:].split("/", 1)
+    return parts[0], parts[1]
 
 def load_audio(
     recording: schemas.Recording,
     start_time: float | None = None,
     end_time: float | None = None,
-    audio_dir: Path | None = None,
+    audio_dir: Path | str | None = None,
     audio_parameters: schemas.AudioParameters | None = None,
+    use_s3: bool = get_settings().use_s3
 ):
     """Load audio.
 
@@ -38,9 +54,11 @@ def load_audio(
     end_time
         End time in seconds.
     audio_dir
-        The directory where the audio files are stored.
+        The directory where the audio files are stored or the S3 URL.
     audio_parameters
         Audio parameters.
+    use_s3
+        If True, fetch the audio file from S3.
 
     Returns
     -------
@@ -59,11 +77,23 @@ def load_audio(
 
     if end_time is None:
         end_time = recording.duration
-
+        
+    local_audio_path = None
+    
+    if use_s3:
+        s3_path = str(recording.path).replace("\\", "/")
+        if not s3_path.startswith("s3://"):
+            s3_path = s3_path.replace("s3:/", "s3://")
+            
+        local_temp_file = Path(tempfile.gettempdir()) / "temp_audio_file.wav"
+        local_audio_path = fetch_s3_file(s3_path, local_temp_file)
+    else:
+        local_audio_path = audio_dir / recording.path
+        
     clip = data.Clip(
         recording=data.Recording(
             uuid=recording.uuid,
-            path=audio_dir / recording.path,
+            path=local_audio_path,
             duration=recording.duration,
             samplerate=recording.samplerate,
             channels=recording.channels,
@@ -72,7 +102,7 @@ def load_audio(
         start_time=start_time,
         end_time=end_time,
     )
-
+    
     if clip.start_time < 0:
         clip.start_time = 0
 
@@ -100,7 +130,6 @@ def load_audio(
 
     return wave
 
-
 BIT_DEPTH_MAP: dict[str, int] = {
     "PCM_S8": 8,
     "PCM_16": 16,
@@ -111,9 +140,8 @@ BIT_DEPTH_MAP: dict[str, int] = {
     "DOUBLE": 64,
 }
 
-
 def load_clip_bytes(
-    path: Path,
+    path: Path | str,
     start: int,
     speed: float = 1,
     frames: int = 8192,
@@ -121,13 +149,14 @@ def load_clip_bytes(
     start_time: float | None = None,
     end_time: float | None = None,
     bit_depth: int = 16,
+    use_s3: bool = get_settings().use_s3
 ) -> tuple[bytes, int, int, int]:
     """Load audio.
 
     Parameters
     ----------
     path
-        The path to the audio file.
+        The path to the audio file or S3 URL.
     start
         Start byte.
     speed
@@ -143,6 +172,8 @@ def load_clip_bytes(
         The time in seconds at which to stop reading the audio.
     bit_depth
         The bit depth of the resulting audio. By default, it is 16 bits.
+    use_s3
+        If True, fetch the audio file from S3.
 
     Returns
     -------
@@ -155,7 +186,15 @@ def load_clip_bytes(
     filesize
         Total size of clip in bytes.
     """
-    with sf.SoundFile(path) as sf_file:
+    local_audio_path = None
+    if use_s3:
+        # Fetch file from S3
+        local_temp_file = Path(tempfile.gettempdir()) / "temp_audio_file.wav"
+        local_audio_path = fetch_s3_file(path, local_temp_file)
+    else:
+        local_audio_path = Path(path)
+        
+    with sf.SoundFile(local_audio_path) as sf_file:
         samplerate = int(sf_file.samplerate * time_expansion)
         channels = sf_file.channels
 
@@ -217,7 +256,6 @@ def load_clip_bytes(
             start + len(audio_bytes),
             filesize + HEADER_SIZE,
         )
-
 
 def generate_wav_header(
     samplerate: int,

@@ -4,10 +4,11 @@ from enum import Enum
 from pathlib import Path
 from uuid import UUID
 
-from pydantic import BaseModel, DirectoryPath, Field
+from pydantic import BaseModel, DirectoryPath, Field, field_validator
 
 from whombat.schemas.base import BaseSchema
 from whombat.schemas.recordings import Recording
+from whombat.system import get_settings
 
 __all__ = [
     "Dataset",
@@ -18,11 +19,12 @@ __all__ = [
     "FileState",
 ]
 
+use_s3 = get_settings().use_s3
 
 class DatasetCreate(BaseModel):
     """Schema for Dataset objects created by the user."""
 
-    audio_dir: DirectoryPath
+    audio_dir: str | DirectoryPath
     """The path to the directory containing the audio files."""
 
     name: str = Field(..., min_length=1)
@@ -30,6 +32,17 @@ class DatasetCreate(BaseModel):
 
     description: str | None = Field(None)
     """The description of the dataset."""
+    
+    @field_validator("audio_dir")
+    def validate_audio_dir(cls, v):
+        """Validate the audio_dir based on use_s3."""
+        if use_s3:
+            if not isinstance(v, str):
+                raise ValueError("audio_dir must be a string when use_s3 is enabled.")
+        else:
+            if not isinstance(v, DirectoryPath):
+                raise ValueError("audio_dir must be a valid local directory.")
+        return v
 
 
 class Dataset(BaseSchema):
@@ -123,5 +136,5 @@ class DatasetRecording(BaseSchema):
     state: FileState = Field(default=FileState.REGISTERED)
     """The state of the file."""
 
-    path: Path
+    path: str | Path
     """The path to the recording in the dataset directory."""
