@@ -43,18 +43,18 @@ class Settings(BaseSettings):
     when changes are made to the source code.
     """
 
-    db_dialect: str = "sqlite"
+    db_dialect: str = "postgresql"
     """Database dialect."""
 
-    db_username: str | None = None
+    db_username: str = "postgres"
 
-    db_password: str | None = None
+    db_password: str = "password"
 
-    db_host: str | None = None
+    db_host: str = "localhost"
 
-    db_port: int | None = None
+    db_port: int = 5432
 
-    db_name: str = "whombat.db"
+    db_name: str = "whombat"
     """Name of the database where all data is stored.
 
     In case of SQLite, this is the path to the database file relative
