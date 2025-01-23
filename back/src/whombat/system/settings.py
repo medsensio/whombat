@@ -46,22 +46,22 @@ class Settings(BaseSettings):
     db_dialect: str = "postgresql"
     """Database dialect."""
 
-    db_username: str = "postgres"
+    db_username: Optional[str] = Field(default="postgres", env="POSTGRES_USER")
 
-    db_password: str = "password"
+    db_password: Optional[str] = Field(default="password", env="POSTGRES_PASSWORD")
 
-    db_host: str = "localhost"
+    db_host: Optional[str] = Field(default="localhost", env="POSTGRES_HOST")
 
-    db_port: int = 5432
+    db_port: Optional[int] = Field(default="5432", env="POSTGRES_PORT")
 
-    db_name: str = "whombat"
+    db_name: Optional[str] = Field(default="whombat", env="POSTGRES_DB")
     """Name of the database where all data is stored.
 
     In case of SQLite, this is the path to the database file relative
     to the project root.
     """
 
-    db_url: str | None = None
+    db_url: Optional[str] = None 
     """Database URL.
 
     If this is set, it will override all other database settings.
@@ -172,9 +172,19 @@ def load_settings_from_file() -> Settings:
 
 def store_default_settings() -> None:
     """Store the default settings to a file."""
-    default_settings = Settings(
-        db_name=str(get_whombat_db_file()),
-    )
+    settings = Settings() 
+
+    if settings.db_dialect == "sqlite":
+        default_settings = Settings(
+            db_name=str(get_whombat_db_file())  
+        )
+    elif settings.db_dialect == "postgresql":
+        default_settings = Settings(
+            db_name=settings.db_name  
+        )
+    else:
+        raise ValueError(f"Unsupported db_dialect: {settings.db_dialect}")
+
     write_settings_to_file(default_settings)
 
 
