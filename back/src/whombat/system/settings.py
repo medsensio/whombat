@@ -61,7 +61,7 @@ class Settings(BaseSettings):
     to the project root.
     """
 
-    db_url: Optional[str] = None 
+    db_url: Optional[str] = "postgresql+asyncpg://whombat_user:N2MWYWz19QPLWMB9@whombat-postgres-staging.ckquiiq4lbow.eu-west-1.rds.amazonaws.com:5432/whombat_db" 
     """Database URL.
 
     If this is set, it will override all other database settings.
