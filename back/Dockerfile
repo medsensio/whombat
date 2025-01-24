@@ -20,7 +20,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 ENV WHOMBAT_AUDIO_DIR /audio
 ENV WHOMBAT_HOST="0.0.0.0"
 ENV WHOMBAT_DOMAIN="localhost"
-ENV WHOMBAT_DB_URL="sqlite+aiosqlite:////data/whombat.db"
+ENV WHOMBAT_DB_URL="postgresql+asyncpg://whombat_user:N2MWYWz19QPLWMB9@whombat-postgres-staging.ckquiiq4lbow.eu-west-1.rds.amazonaws.com:5432/whombat_db"
 ENV PATH="/code/.venv/bin:$PATH"
 
 # Run the command to start the web server
