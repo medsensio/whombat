@@ -21,8 +21,8 @@ export function registerUserAPI(
       const result = schemas.UserSchema.parse(response.data);
       console.log("Result:", result);
       return result;
-    } catch (error) {
-      console.error("Error fetching active user:", error);
+    } catch (error : any) {
+      console.error("Error fetching active user:", error.response);
       throw error;
     }
   }
