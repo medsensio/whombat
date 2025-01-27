@@ -94,7 +94,7 @@ VOLUME ["/data"]
 
 # Set the environment variables for the audio directory and the database URL
 ENV WHOMBAT_AUDIO_DIR /audio
-ENV WHOMBAT_DB_URL "postgresql+asyncpg://whombat_user:N2MWYWz19QPLWMB9@whombat-postgres-staging.ckquiiq4lbow.eu-west-1.rds.amazonaws.com:5432/whombat_db"
+ENV WHOMBAT_DB_URL ""
 ENV WHOMBAT_DEV "true"
 ENV WHOMBAT_HOST "0.0.0.0"
 ENV WHOMBAT_PORT "5000"
