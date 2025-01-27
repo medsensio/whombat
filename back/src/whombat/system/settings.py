@@ -21,12 +21,15 @@ from pydantic import  Field
 from typing import Optional
 
 from whombat.system.data import get_whombat_db_file, get_whombat_settings_file
+from dotenv import load_dotenv
+import os
 
 __all__ = [
     "get_settings",
     "Settings",
 ]
 
+load_dotenv()
 
 class Settings(BaseSettings):
     """Settings for whombat."""
@@ -46,15 +49,15 @@ class Settings(BaseSettings):
     db_dialect: str = "postgresql"
     """Database dialect."""
 
-    db_username: Optional[str] = Field(default="postgres", env="POSTGRES_USER")
+    db_username: Optional[str] = os.getenv("POSTGRES_USER", "postgres")
 
-    db_password: Optional[str] = Field(default="password", env="POSTGRES_PASSWORD")
+    db_password: Optional[str] = os.getenv("POSTGRES_PASSWORD", "password") 
 
-    db_host: Optional[str] = Field(default="localhost", env="POSTGRES_HOST")
+    db_host: Optional[str] = os.getenv("POSTGRES_HOST", "localhost")
 
-    db_port: Optional[int] = Field(default="5432", env="POSTGRES_PORT")
+    db_port: Optional[int] = os.getenv("POSTGRES_PORT", "5432") 
 
-    db_name: Optional[str] = Field(default="whombat", env="POSTGRES_DB")
+    db_name: Optional[str] = os.getenv("POSTGRES_DB", "whombat") 
     """Name of the database where all data is stored.
 
     In case of SQLite, this is the path to the database file relative
