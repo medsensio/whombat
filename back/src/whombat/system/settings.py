@@ -106,7 +106,7 @@ class Settings(BaseSettings):
     Should be set to INFO in production.
     """
 
-    cors_origins: list[str] = ["*"]
+    cors_origins: list[str] = ["https://whombat.staging.medsens.io"]
     """Allowed origins for CORS."""
 
     open_on_startup: bool = True
