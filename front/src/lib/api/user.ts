@@ -14,9 +14,19 @@ export function registerUserAPI(
   endpoints: typeof DEFAULT_ENDPOINTS = DEFAULT_ENDPOINTS,
 ) {
   async function getActiveUser(): Promise<types.User> {
-    let response = await instance.get(endpoints.me);
-    return schemas.UserSchema.parse(response.data);
+    try {
+      console.log("Sending GET request to:", endpoints.me);
+      let response = await instance.get(endpoints.me);
+      console.log("Response data:", response.data);
+      const result = schemas.UserSchema.parse(response.data);
+      console.log("Result:", result);
+      return result;
+    } catch (error) {
+      console.error("Error fetching active user:", error);
+      throw error;
+    }
   }
+  
 
   async function updateActiveUser(data: types.UserUpdate): Promise<types.User> {
     let body = schemas.UserUpdateSchema.parse(data);
