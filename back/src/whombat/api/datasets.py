@@ -477,9 +477,9 @@ class DatasetAPI(
             List of DatasetFile objects with their state.
         """
 
-        if use_s3:
-            dataset_dir = str(obj.audio_dir) 
+        dataset_dir = str(obj.audio_dir) 
 
+        if use_s3:
             try:
                 # Fetch files from S3
                 file_keys = s3_client.list_files(bucket_name=bucket_name, prefix=dataset_dir)
@@ -503,8 +503,24 @@ class DatasetAPI(
         query = select(models.DatasetRecording.path).where(
             models.DatasetRecording.dataset_id == obj.id
         )
-        result = await session.execute(query)       
-        db_files = [Path(path) for path in result.scalars().all()]
+        result = await session.execute(query)
+
+        # Fetch the database file paths
+        db_files = result.scalars().all()
+
+        # If use_s3, ensure the prefix is added to paths that don't already have it
+        if use_s3:
+            # Prefix to prepend if missing
+            bucket_prefix = f"s3://{bucket_name}/{dataset_dir}/"
+            
+            # Prepend the prefix to paths in db_files that do not have it
+            db_files = [
+                Path(path if path.startswith(bucket_prefix) else f"{bucket_prefix}{path}")
+                for path in db_files
+            ]
+        else:
+            # For local paths, just convert them to Path objects
+            db_files = [Path(path) for path in db_files]
 
         existing_files = set(file_list) & set(db_files)
         missing_files = set(db_files) - set(file_list)
