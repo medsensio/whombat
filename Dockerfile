@@ -102,7 +102,7 @@ ENV WHOMBAT_LOG_LEVEL "info"
 ENV WHOMBAT_LOG_TO_STDOUT "true"
 ENV WHOMBAT_LOG_TO_FILE "true"
 ENV WHOMBAT_OPEN_ON_STARTUP "false"
-ENV WHOMBAT_DOMAIN "whombat.staging.medsens.io"
+ENV WHOMBAT_DOMAIN ${WHOMBAT_DOMAIN:-"localhost"}
 
 # Expose the port for the web server
 EXPOSE 5000
