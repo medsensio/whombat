@@ -513,11 +513,18 @@ class DatasetAPI(
             # Prefix to prepend if missing
             bucket_prefix = f"s3://{bucket_name}/{dataset_dir}/"
             
-            # Prepend the prefix to paths in db_files that do not have it
-            db_files = [
-                Path(path if path.startswith(bucket_prefix) else f"{bucket_prefix}{path}")
-                for path in db_files
-            ]
+            formatted_files = []
+            for path in db_files:
+                path = str(path).replace("\\", "/")  
+                path = path.replace("s3:/", "s3://") 
+
+                # If the path already has the correct prefix, use as is; otherwise, prepend bucket_prefix
+                if path.startswith(bucket_prefix):
+                    formatted_files.append(Path(path))
+                else:
+                    formatted_files.append(Path(f"{bucket_prefix}{Path(path).name}"))
+
+            db_files = formatted_files
         else:
             # For local paths, just convert them to Path objects
             db_files = [Path(path) for path in db_files]
