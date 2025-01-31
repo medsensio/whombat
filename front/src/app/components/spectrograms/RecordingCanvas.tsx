@@ -65,7 +65,7 @@ export default function RecordingCanvas({
 
   return (
     <CanvasBase
-      viewport={viewport.viewport}
+      viewport={viewport.bounds}
       height={height}
       drawFn={drawFn}
       {...props}
