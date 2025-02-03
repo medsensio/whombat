@@ -649,19 +649,6 @@ class DatasetAPI(
             created_on=obj.created_on,
             recordings=soundevent_recordings,
         )
-    
-    async def dataset_exists(
-        self,
-        session: AsyncSession,
-        name: str
-    ) -> bool : 
-        existing_dataset_query = await session.execute(
-            select(models.Dataset).where(models.Dataset.name.ilike(name))
-        )
-        existing_dataset = existing_dataset_query.scalars().first()
-
-        # Return True if the dataset exists, False otherwise
-        return existing_dataset is not None
 
     async def create(
         self,
@@ -706,11 +693,11 @@ class DatasetAPI(
             If no recordings were created.
         """
 
-        # Check if a dataset with the same name already exists 
-        if await self.dataset_exists(session, name):
+        existing_dataset = await self.get_by_name(session, name)
+        if existing_dataset:
             raise HTTPException(
                 status_code=400,
-                detail=f"Dataset with the given name '{name}' already exists.",
+                detail=f"Dataset with the name '{name}' already exists."
             )
 
         if use_s3:
