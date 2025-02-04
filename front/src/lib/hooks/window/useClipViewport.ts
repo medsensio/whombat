@@ -9,16 +9,21 @@ import { getInitialViewingWindow } from "@/lib/utils/windows";
 export default function useClipViewport({
   clip,
   spectrogramSettings = DEFAULT_SPECTROGRAM_SETTINGS,
+  audioSettings 
 }: {
   clip: Clip;
   spectrogramSettings?: SpectrogramSettings;
+  audioSettings: any; 
 }) {
   const bounds = useMemo(
     () => ({
       time: { min: clip.start_time, max: clip.end_time },
-      freq: { min: 0, max: clip.recording.samplerate / 2 },
+      freq: {
+        min: audioSettings.settings.low_freq ?? 0, 
+        max: audioSettings.settings.high_freq ?? clip.recording.samplerate / 2, 
+      },
     }),
-    [clip.recording.samplerate, clip.start_time, clip.end_time],
+    [clip.recording.samplerate, clip.start_time, clip.end_time, audioSettings.settings.low_freq, audioSettings.settings.high_freq],
   );
 
   const initial = useMemo(

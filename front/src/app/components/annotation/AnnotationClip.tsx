@@ -47,6 +47,7 @@ export default function ClipAnnotationSpectrogram({
   const viewport = useClipViewport({
     clip: data.clip,
     spectrogramSettings: spectrogramSettings.settings,
+    audioSettings
   });
 
   const audio = useSpectrogramAudio({
