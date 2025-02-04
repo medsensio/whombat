@@ -146,12 +146,17 @@ class DatasetAPI(
         whombat.exceptions.NotFoundError
             If no dataset with the given name exists.
         """
-        dataset = await common.get_object(
-            session,
-            models.Dataset,
-            models.Dataset.name == name,
-        )
-        return schemas.Dataset.model_validate(dataset)
+        try:
+            dataset = await common.get_object(
+                session,
+                models.Dataset,
+                models.Dataset.name == name,
+            )
+            if dataset:
+                return schemas.Dataset.model_validate(dataset)
+            return None    
+        except Exception as e:
+            return None   
 
     async def add_file(
         self,
