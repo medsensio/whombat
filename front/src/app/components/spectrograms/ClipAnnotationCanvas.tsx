@@ -237,12 +237,12 @@ export default function ClipAnnotationCanvas({
   return (
     <SpectrogramTags
       soundEvents={data.sound_events || []}
-      viewport={viewport.viewport}
+      viewport={viewport.bounds}
       SoundEventTags={SoundEventSpectrogramTags}
       enabled={enabled}
     >
       <CanvasBase
-        viewport={viewport.viewport}
+        viewport={viewport.bounds}
         height={height}
         drawFn={drawFn}
         canvasRef={ref}

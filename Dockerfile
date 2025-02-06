@@ -94,7 +94,7 @@ VOLUME ["/data"]
 
 # Set the environment variables for the audio directory and the database URL
 ENV WHOMBAT_AUDIO_DIR /audio
-ENV WHOMBAT_DB_URL "sqlite+aiosqlite:////data/whombat.db"
+ENV WHOMBAT_DB_URL ""
 ENV WHOMBAT_DEV "true"
 ENV WHOMBAT_HOST "0.0.0.0"
 ENV WHOMBAT_PORT "5000"
@@ -102,7 +102,7 @@ ENV WHOMBAT_LOG_LEVEL "info"
 ENV WHOMBAT_LOG_TO_STDOUT "true"
 ENV WHOMBAT_LOG_TO_FILE "true"
 ENV WHOMBAT_OPEN_ON_STARTUP "false"
-ENV WHOMBAT_DOMAIN "localhost"
+ENV WHOMBAT_DOMAIN ${WHOMBAT_DOMAIN:-"localhost"}
 
 # Expose the port for the web server
 EXPOSE 5000

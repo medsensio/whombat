@@ -36,6 +36,7 @@ export default function ClipEvaluationSpectrogram(
   const viewport = useClipViewport({
     clip,
     spectrogramSettings: spectrogramSettings.settings,
+    audioSettings
   });
 
   const audio = useSpectrogramAudio({

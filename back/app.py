@@ -9,6 +9,10 @@ import multiprocessing
 import uvicorn
 
 from whombat.system import create_app, get_logging_config, get_settings
+from whombat.system.settings import store_default_settings
+
+# Overwrite the settings.json on every restart
+store_default_settings()
 
 settings = get_settings()
 config = get_logging_config(settings)

@@ -5,6 +5,8 @@ export const UserSchema = z.object({
   username: z.string(),
   email: z.string().email().optional(),
   name: z.string().nullable().optional(),
+  is_superuser: z.boolean().optional(),
+  created_on: z.coerce.date().optional(),
 });
 
 export const UserCreateSchema = z

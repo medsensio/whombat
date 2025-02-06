@@ -161,6 +161,10 @@ export const DatasetFilterSchema = z.object({
   search: z.string().optional(),
 });
 
+export const UserFilterSchema = z.object({
+  search: z.string().optional(),
+});
+
 export const RecordingFilterSchema = z.object({
   search: z.string().optional(),
   dataset: DatasetSchema.optional(),

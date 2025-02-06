@@ -29,6 +29,7 @@ from whombat.system import get_settings
 from whombat.schemas.recordings import RecordingCreate 
 from whombat.utils.aws_s3_client import S3Client
 from tempfile import TemporaryDirectory
+from sqlalchemy.future import select
 
 __all__ = [
     "RecordingAPI",
@@ -262,26 +263,42 @@ class RecordingAPI(
                 # Deduplicate based on the "hash" key
                 unique_recordings_data = {rec["hash"]: rec for rec in recordings_data}.values()
 
-                # Create Recording objects from the filtered data
-                recording_objects = [
-                    models.Recording(**recording_data) for recording_data in unique_recordings_data
+                # Extract hashes from the incoming data
+                incoming_hashes = [rec["hash"] for rec in unique_recordings_data]
+
+                # Query existing recordings with the same hashes
+                existing_recordings_query = await session.execute(
+                    select(models.Recording).where(models.Recording.hash.in_(incoming_hashes))
+                )
+                existing_recordings = existing_recordings_query.unique().scalars().all()
+
+                # Get the set of existing hashes
+                existing_hashes = {rec.hash for rec in existing_recordings}
+
+                # Filter out recordings that already exist
+                new_recordings_data = [
+                    rec for rec in unique_recordings_data if rec["hash"] not in existing_hashes
                 ]
 
-                # Add the new recordings to the session
-                session.add_all(recording_objects)
+                # Create new Recording objects
+                new_recording_objects = [
+                    models.Recording(**recording_data) for recording_data in new_recordings_data
+                ]
 
-                # Commit the session to persist the data
-                await session.commit()
+                # Add new recordings to the session and commit
+                if new_recording_objects:
+                    session.add_all(new_recording_objects)
+                    await session.commit()
 
-                # Return or log the saved recordings if needed
-                recordings = recording_objects
+                # Combine newly created and existing recordings
+                all_recordings = existing_recordings + new_recording_objects
 
             except Exception as e:
-                # Handle exceptions
                 print(f"Error while storing recordings: {e}")
-                await session.rollback()  # Rollback in case of an error
-                                            
-            return [schemas.Recording.model_validate(rec) for rec in recordings]
+                await session.rollback()  
+                return [] 
+
+            return [schemas.Recording.model_validate(rec) for rec in all_recordings]
         else: 
             if audio_dir is None:
                 audio_dir = get_settings().audio_dir
