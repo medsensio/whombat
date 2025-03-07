@@ -146,12 +146,17 @@ class DatasetAPI(
         whombat.exceptions.NotFoundError
             If no dataset with the given name exists.
         """
-        dataset = await common.get_object(
-            session,
-            models.Dataset,
-            models.Dataset.name == name,
-        )
-        return schemas.Dataset.model_validate(dataset)
+        try:
+            dataset = await common.get_object(
+                session,
+                models.Dataset,
+                models.Dataset.name == name,
+            )
+            if dataset:
+                return schemas.Dataset.model_validate(dataset)
+            return None    
+        except Exception as e:
+            return None   
 
     async def add_file(
         self,
@@ -477,9 +482,9 @@ class DatasetAPI(
             List of DatasetFile objects with their state.
         """
 
-        if use_s3:
-            dataset_dir = str(obj.audio_dir) 
+        dataset_dir = str(obj.audio_dir) 
 
+        if use_s3:
             try:
                 # Fetch files from S3
                 file_keys = s3_client.list_files(bucket_name=bucket_name, prefix=dataset_dir)
@@ -503,8 +508,31 @@ class DatasetAPI(
         query = select(models.DatasetRecording.path).where(
             models.DatasetRecording.dataset_id == obj.id
         )
-        result = await session.execute(query)       
-        db_files = [Path(path) for path in result.scalars().all()]
+        result = await session.execute(query)
+
+        # Fetch the database file paths
+        db_files = result.scalars().all()
+
+        # If use_s3, ensure the prefix is added to paths that don't already have it
+        if use_s3:
+            # Prefix to prepend if missing
+            bucket_prefix = f"s3://{bucket_name}/{dataset_dir}/"
+            
+            formatted_files = []
+            for path in db_files:
+                path = str(path).replace("\\", "/")  
+                path = path.replace("s3:/", "s3://") 
+
+                # If the path already has the correct prefix, use as is; otherwise, prepend bucket_prefix
+                if path.startswith(bucket_prefix):
+                    formatted_files.append(Path(path))
+                else:
+                    formatted_files.append(Path(f"{bucket_prefix}{Path(path).name}"))
+
+            db_files = formatted_files
+        else:
+            # For local paths, just convert them to Path objects
+            db_files = [Path(path) for path in db_files]
 
         existing_files = set(file_list) & set(db_files)
         missing_files = set(db_files) - set(file_list)
@@ -669,6 +697,14 @@ class DatasetAPI(
         RuntimeError
             If no recordings were created.
         """
+
+        existing_dataset = await self.get_by_name(session, name)
+        if existing_dataset:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Dataset with the name '{name}' already exists."
+            )
+
         if use_s3:
             # Ensure dataset_dir ends with a `/`
             if not dataset_dir.endswith("/"):

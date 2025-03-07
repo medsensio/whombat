@@ -3,6 +3,7 @@ import { usePathname } from "next/navigation";
 import type { ComponentProps } from "react";
 
 import useActiveUser from "@/app/hooks/api/useActiveUser";
+import { useSession } from "@/app/store/session";
 
 import {
   AnnotationProjectIcon,
@@ -14,6 +15,7 @@ import {
   PluginIcon,
   SettingsIcon,
   WhombatIcon,
+  UsersIcon
 } from "@/lib/components/icons";
 import { HorizontalDivider } from "@/lib/components/layouts/Divider";
 import Button from "@/lib/components/ui/Button";
@@ -92,6 +94,7 @@ function SideMenuButton({
 }
 
 function MainNavigation({ pathname }: { pathname?: string }) {
+  const { user } = useSession();
   return (
     <ul className="flex flex-col space-y-3 py-4 text-stone-400">
       <li className="px-3">
@@ -130,6 +133,17 @@ function MainNavigation({ pathname }: { pathname?: string }) {
           <ExplorationIcon className="w-6 h-6" />
         </SideMenuLink>
       </li>
+      {user?.is_superuser && (
+        <li className="px-3">
+          <SideMenuLink
+            isActive={pathname?.startsWith("/users")}
+            tooltip={"Users"}
+            href="/users"
+          >
+            <UsersIcon className="w-6 h-6" />
+          </SideMenuLink>
+        </li>
+      )}
     </ul>
   );
 }

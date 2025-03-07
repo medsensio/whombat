@@ -19,8 +19,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 ENV WHOMBAT_AUDIO_DIR /audio
 ENV WHOMBAT_HOST="0.0.0.0"
-ENV WHOMBAT_DOMAIN="localhost"
-ENV WHOMBAT_DB_URL="sqlite+aiosqlite:////data/whombat.db"
+ENV WHOMBAT_DOMAIN=${WHOMBAT_DOMAIN:-"localhost"}
+ENV WHOMBAT_DB_URL=""
 ENV PATH="/code/.venv/bin:$PATH"
 
 # Run the command to start the web server

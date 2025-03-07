@@ -31,6 +31,7 @@ export default function RecordingSpectrogram({
   const viewport = useRecordingViewport({
     recording,
     spectrogramSettings: spectrogramSettings.settings,
+    audioSettings
   });
 
   const audio = useSpectrogramAudio({

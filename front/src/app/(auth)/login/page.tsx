@@ -12,6 +12,8 @@ import { Group, Input } from "@/lib/components/inputs/index";
 import Info from "@/lib/components/ui/Info";
 import Link from "@/lib/components/ui/Link";
 
+import { useSession } from "@/app/store/session";
+
 const schema = z.object({
   username: z.string(),
   password: z.string(),
@@ -20,6 +22,8 @@ type FormData = z.infer<typeof schema>;
 
 export default function LoginForm() {
   const params = useSearchParams();
+
+  const { login } = useSession();
 
   const {
     register,
@@ -34,23 +38,21 @@ export default function LoginForm() {
 
   const router = useRouter();
 
-  const onSubmit = (data: FormData) => {
-    api.auth
-      .login(data)
-      .catch(() => {
-        reset();
-        setError("username", { message: "Invalid username or password" });
-        setError("password", { message: "Invalid username or password" });
-        return Promise.reject("Invalid username or password");
-      })
-      .then(() => {
-        const back = params.get("back");
-        if (back) {
-          router.push(back);
-        } else {
-          router.push("/");
-        }
-      });
+  const onSubmit = async (data: FormData) => {
+    try {
+      await api.auth.login(data);
+
+      const user = await api.user.me();
+
+      login(user);
+
+      const back = params.get("back");
+      router.push(back ? back : "/");
+    } catch (error) {
+      reset();
+      setError("username", { message: "Invalid username or password" });
+      setError("password", { message: "Invalid username or password" });
+    }
   };
 
   return (

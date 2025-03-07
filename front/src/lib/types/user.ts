@@ -11,3 +11,5 @@ export type UserCreate = z.input<typeof schemas.UserCreateSchema>;
 export type UserUpdate = z.input<typeof schemas.UserUpdateSchema>;
 
 export type PasswordUpdate = z.input<typeof schemas.PasswordUpdateSchema>;
+
+export type UserFilter = z.input<typeof schemas.UserFilterSchema>;
